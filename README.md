@@ -21,7 +21,7 @@ services tui 'YOUR_SUDO_PASSWORD'
 services --user tui
 ```
 
-The system TUI checks the password once and opens an elevated session. Use arrow keys or `j`/`k` to select a service, `Enter` for status, `?` for all shortcuts, and `q` to quit. The UI asks for confirmation before stopping, restarting, disabling, masking, or removing a service. Removal stops and disables the service and deletes its local unit file.
+The system TUI checks the password once and opens an elevated session. The opening list focuses on running, failed, and enabled services. Press `Tab` to show every service, `/` to search by name or description, arrow keys or `j`/`k` to move, `Enter` for status, `?` for all shortcuts, and `q` to quit. Press `Esc` to cancel a prompt. The UI asks for confirmation before stopping, restarting, disabling, masking, or removing a service. Removal stops and disables the service and deletes its local unit file.
 
 Putting a password on the command line can expose it in shell history and process listings. If that matters on your machine, run `sudo services tui` instead; an already elevated TUI needs no password argument. The application installed above is named `services`. If you build it under the name `service`, the same subcommand works as `service tui 'YOUR_SUDO_PASSWORD'`.
 

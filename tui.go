@@ -7,16 +7,20 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"unicode"
 
+	"github.com/mattn/go-runewidth"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
 var errTUIQuit = errors.New("quit TUI")
+var errTUICancel = errors.New("cancelled")
 
 type serviceRow struct {
-	name, state string
+	name, state, runtime, description string
 }
 
 type tuiState struct {
@@ -26,6 +30,8 @@ type tuiState struct {
 	rows     []serviceRow
 	selected int
 	message  string
+	query    string
+	showAll  bool
 }
 
 func (a *app) tui(args []string) error {
@@ -52,7 +58,7 @@ func (a *app) tui(args []string) error {
 	}
 	defer term.Restore(int(tty.Fd()), old)
 	fmt.Fprint(tty, "\x1b[?1049h\x1b[?25l")
-	defer fmt.Fprint(tty, "\x1b[?25h\x1b[?1049l")
+	defer fmt.Fprint(tty, "\x1b[0m\x1b[?25h\x1b[?1049l")
 	t := &tuiState{app: a, tty: tty, keys: bufio.NewReader(tty)}
 	if err := t.refresh(); err != nil {
 		t.message = err.Error()
@@ -102,16 +108,60 @@ func (t *tuiState) refresh() error {
 		return err
 	}
 	t.rows = nil
+	byName := map[string]int{}
 	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && strings.HasSuffix(fields[0], ".service") {
-			t.rows = append(t.rows, serviceRow{fields[0], fields[1]})
+			byName[fields[0]] = len(t.rows)
+			t.rows = append(t.rows, serviceRow{name: fields[0], state: fields[1], runtime: "inactive"})
 		}
 	}
+	// list-unit-files supplies boot state; list-units supplies live state and description.
+	// A failed live-state query should not make the entire browser unusable.
+	live, liveErr := t.app.capture(func() error {
+		return t.app.systemctl("list-units", "--all", "--type=service", "--no-legend", "--no-pager", "--plain")
+	})
+	if liveErr == nil {
+		for _, line := range strings.Split(live, "\n") {
+			fields := strings.Fields(line)
+			if len(fields) > 0 && fields[0] == "●" {
+				fields = fields[1:]
+			}
+			if len(fields) < 4 || !strings.HasSuffix(fields[0], ".service") {
+				continue
+			}
+			if i, ok := byName[fields[0]]; ok {
+				t.rows[i].runtime = fields[2]
+				if len(fields) > 4 {
+					t.rows[i].description = strings.Join(fields[4:], " ")
+				}
+			}
+		}
+	}
+	sort.Slice(t.rows, func(i, j int) bool {
+		a, b := t.rows[i], t.rows[j]
+		priority := func(row serviceRow) int {
+			if row.runtime == "failed" {
+				return 0
+			}
+			if row.runtime == "running" {
+				return 1
+			}
+			if strings.HasPrefix(row.state, "enabled") {
+				return 2
+			}
+			return 3
+		}
+		if priority(a) != priority(b) {
+			return priority(a) < priority(b)
+		}
+		return a.name < b.name
+	})
 	if selected != "" {
 		for i, row := range t.rows {
 			if row.name == selected {
 				t.selected = i
+				t.ensureSelection()
 				return nil
 			}
 		}
@@ -119,98 +169,337 @@ func (t *tuiState) refresh() error {
 	if t.selected >= len(t.rows) {
 		t.selected = max(0, len(t.rows)-1)
 	}
+	t.ensureSelection()
 	return nil
+}
+
+func (t *tuiState) visible() []int {
+	var result []int
+	for i, row := range t.rows {
+		if !t.showAll && row.runtime != "running" && row.runtime != "failed" && !strings.HasPrefix(row.state, "enabled") {
+			continue
+		}
+		if t.query != "" && !strings.Contains(strings.ToLower(row.name+" "+row.description), strings.ToLower(t.query)) {
+			continue
+		}
+		result = append(result, i)
+	}
+	return result
+}
+
+func (t *tuiState) ensureSelection() {
+	for _, i := range t.visible() {
+		if i == t.selected {
+			return
+		}
+	}
+	if rows := t.visible(); len(rows) > 0 {
+		t.selected = rows[0]
+	}
+}
+
+func (t *tuiState) move(delta int) {
+	rows := t.visible()
+	for n, i := range rows {
+		if i == t.selected {
+			t.selected = rows[max(0, min(len(rows)-1, n+delta))]
+			return
+		}
+	}
+	if len(rows) > 0 {
+		t.selected = rows[0]
+	}
 }
 
 func (t *tuiState) name() string {
 	if t.selected < 0 || t.selected >= len(t.rows) {
 		return ""
 	}
-	return t.rows[t.selected].name
+	for _, i := range t.visible() {
+		if i == t.selected {
+			return t.rows[i].name
+		}
+	}
+	return ""
 }
 
 func (t *tuiState) size() (int, int) {
 	w, h, err := term.GetSize(int(t.tty.Fd()))
-	if err != nil || w < 30 || h < 10 {
+	if err != nil || w <= 0 || h <= 0 {
 		return 80, 24
 	}
 	return w, h
 }
 
 func clean(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\t' || (unicode.IsPrint(r) && r != '\x1b') {
-			return r
+	var b strings.Builder
+	escape := 0
+	for _, r := range s {
+		switch escape {
+		case 1:
+			if r == '[' {
+				escape = 2
+			} else if r == ']' {
+				escape = 3
+			} else {
+				escape = 0
+			}
+			continue
+		case 2:
+			if r >= '@' && r <= '~' {
+				escape = 0
+			}
+			continue
+		case 3:
+			if r == '\a' {
+				escape = 0
+			} else if r == '\x1b' {
+				escape = 4
+			}
+			continue
+		case 4:
+			if r == '\\' {
+				escape = 0
+			} else {
+				escape = 3
+			}
+			continue
 		}
-		return -1
-	}, s)
+		if r == '\x1b' {
+			escape = 1
+			continue
+		}
+		if r == '\n' || r == '\t' || unicode.IsPrint(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func fit(s string, width int) string {
 	s = strings.NewReplacer("\n", " ", "\t", " ").Replace(clean(s))
-	r := []rune(s)
-	if len(r) > width {
-		if width > 1 {
-			return string(r[:width-1]) + "…"
-		}
-		return string(r[:width])
+	if width <= 0 {
+		return ""
 	}
-	return s
+	if runewidth.StringWidth(s) <= width {
+		return s
+	}
+	limit := width - 1
+	if width == 1 {
+		limit = 1
+	}
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		cells := runewidth.RuneWidth(r)
+		if used+cells > limit {
+			break
+		}
+		b.WriteRune(r)
+		used += cells
+	}
+	if width == 1 {
+		return b.String()
+	}
+	return b.String() + "…"
+}
+
+func (t *tuiState) screen(w, h int) string {
+	if w < 2 || h < 1 {
+		return ""
+	}
+	usable := w - 1 // Avoid writing in the last column, which can auto-wrap in PTYs.
+	rows := t.visible()
+	position := 0
+	for i, index := range rows {
+		if index == t.selected {
+			position = i
+			break
+		}
+	}
+	running, failed := 0, 0
+	for _, row := range t.rows {
+		if row.runtime == "running" {
+			running++
+		}
+		if row.runtime == "failed" {
+			failed++
+		}
+	}
+	scope := "SYSTEM"
+	if t.app.user {
+		scope = "USER"
+	}
+	mode := "FOCUS"
+	if t.showAll {
+		mode = "ALL"
+	}
+	header := fmt.Sprintf(" SERVICES   %s  /  %s", scope, mode)
+	if w >= 58 {
+		header += fmt.Sprintf("                         %d running  ·  %d failed", running, failed)
+	}
+	subtitle := fmt.Sprintf(" %d services", len(rows))
+	if t.query != "" {
+		subtitle += "  /  " + t.query
+	}
+	if !t.showAll && t.query == "" {
+		subtitle += "  ·  running, failed, or enabled"
+	}
+	lines := []string{header, subtitle, " " + strings.Repeat("─", max(0, usable-2))}
+	nameWidth := max(10, usable-34)
+	if w >= 80 {
+		nameWidth = min(38, max(22, usable/3))
+	}
+	if h >= 7 {
+		if w >= 67 {
+			lines = append(lines, fmt.Sprintf("  %-*s %-10s %-10s %s", nameWidth, "SERVICE", "LIVE", "BOOT", "DESCRIPTION"))
+		} else if w >= 48 {
+			lines = append(lines, fmt.Sprintf("  %-*s %-10s %s", max(10, usable-27), "SERVICE", "LIVE", "BOOT"))
+		} else {
+			lines = append(lines, "  SERVICE                     LIVE")
+		}
+	}
+	footerRows := 2
+	available := max(0, h-len(lines)-footerRows)
+	start := max(0, position-available+1)
+	if available > 0 && position < available {
+		start = 0
+	}
+	for i := 0; i < available; i++ {
+		if start+i >= len(rows) {
+			lines = append(lines, "")
+			continue
+		}
+		index := rows[start+i]
+		row := t.rows[index]
+		marker := "  "
+		if index == t.selected {
+			marker = "› "
+		}
+		status := row.runtime
+		if status == "" {
+			status = "inactive"
+		}
+		var line string
+		if w >= 67 {
+			line = fmt.Sprintf("%s%-*s %-10s %-10s %s", marker, nameWidth, fit(row.name, nameWidth), fit(status, 10), fit(row.state, 10), row.description)
+		} else if w >= 48 {
+			nw := max(10, usable-27)
+			line = fmt.Sprintf("%s%-*s %-10s %s", marker, nw, fit(row.name, nw), fit(status, 10), row.state)
+		} else {
+			nw := max(4, usable-13)
+			line = fmt.Sprintf("%s%-*s %s", marker, nw, fit(row.name, nw), status)
+		}
+		lines = append(lines, line)
+	}
+	if len(rows) == 0 && available > 0 {
+		message := "No matching services. Press Tab for all or / to search."
+		if t.showAll {
+			message = "No matching services. Press / to change the search."
+		}
+		lines[len(lines)-available] = "  " + message
+	}
+	if h >= 2 {
+		lines = append(lines, " "+strings.Repeat("─", max(0, usable-2)))
+		footer := " ↑↓ move   Enter status   / search   Tab scope   ? help   q quit"
+		if t.message != "" {
+			footer = " " + t.message
+		}
+		lines = append(lines, footer)
+	}
+	if len(lines) > h {
+		lines = lines[:h]
+	}
+	for len(lines) < h {
+		lines = append(lines, "")
+	}
+	var b strings.Builder
+	b.WriteString("\x1b[H")
+	for i, line := range lines {
+		if i > 0 {
+			b.WriteString("\r\n")
+		}
+		b.WriteString("\x1b[2K")
+		if i == 0 {
+			b.WriteString("\x1b[1;36m")
+		}
+		bodyStart := 3
+		if h >= 7 {
+			bodyStart = 4
+		}
+		if i >= bodyStart && i < bodyStart+available && start+i-bodyStart < len(rows) {
+			row := t.rows[rows[start+i-bodyStart]]
+			if rows[start+i-bodyStart] == t.selected {
+				b.WriteString("\x1b[1;7m")
+			} else if row.runtime == "failed" {
+				b.WriteString("\x1b[31m")
+			} else if row.runtime == "running" {
+				b.WriteString("\x1b[32m")
+			} else {
+				b.WriteString("\x1b[2m")
+			}
+		}
+		b.WriteString(fit(line, usable))
+		b.WriteString("\x1b[0m")
+	}
+	return b.String()
 }
 
 func (t *tuiState) draw() {
 	w, h := t.size()
-	fmt.Fprint(t.tty, "\x1b[H\x1b[2J")
-	scope := "system"
-	if t.app.user {
-		scope = "user"
-	}
-	fmt.Fprintln(t.tty, fit(" SERVICES  ("+scope+")  ↑/↓ select  Enter status  ? help  q quit", w))
-	fmt.Fprintln(t.tty, strings.Repeat("─", min(w, 80)))
-	visible := h - 6
-	start := 0
-	if t.selected >= visible {
-		start = t.selected - visible + 1
-	}
-	for i := 0; i < visible; i++ {
-		index := start + i
-		if index < len(t.rows) {
-			row := t.rows[index]
-			prefix := "  "
-			if index == t.selected {
-				prefix = "▶ "
-			}
-			fmt.Fprintln(t.tty, fit(fmt.Sprintf("%s%-48s %s", prefix, row.name, row.state), w))
-		} else {
-			fmt.Fprintln(t.tty)
-		}
-	}
-	fmt.Fprintln(t.tty, strings.Repeat("─", min(w, 80)))
-	fmt.Fprintln(t.tty, fit("n new  e edit  u unset  c clone  s start  t stop  r restart  b boot  m mask", w))
-	fmt.Fprintln(t.tty, fit("v unit  l logs  x remove  R refresh", w))
-	fmt.Fprint(t.tty, fit(t.message, w))
+	fmt.Fprint(t.tty, t.screen(w, h))
 }
 
 func (t *tuiState) key() (rune, error) {
+	if t.keys.Buffered() == 0 {
+		fds := []unix.PollFd{{Fd: int32(t.tty.Fd()), Events: unix.POLLIN}}
+		n, err := unix.Poll(fds, 250)
+		if err != nil {
+			if err == unix.EINTR {
+				return 0, nil
+			}
+			return 0, err
+		}
+		if n == 0 {
+			return 0, nil
+		}
+	}
 	r, _, err := t.keys.ReadRune()
 	if err != nil {
 		return 0, err
 	}
 	if r == 27 {
-		// Arrow keys arrive as ESC [ A/B. Escape alone is ignored by the UI.
-		if t.keys.Buffered() >= 2 {
-			first, _, _ := t.keys.ReadRune()
-			second, _, _ := t.keys.ReadRune()
-			if first == '[' {
-				if second == 'A' {
-					return 'k', nil
-				}
-				if second == 'B' {
-					return 'j', nil
-				}
+		// SSH can deliver each byte separately. Give the rest of an escape
+		// sequence a short window to arrive before treating Escape as cancel.
+		if t.keys.Buffered() == 0 {
+			fds := []unix.PollFd{{Fd: int32(t.tty.Fd()), Events: unix.POLLIN}}
+			if n, _ := unix.Poll(fds, 40); n == 0 {
+				return 27, nil
 			}
 		}
-		return 0, nil
+		first, _, err := t.keys.ReadRune()
+		if err != nil {
+			return 27, nil
+		}
+		if first == '[' || first == 'O' {
+			if t.keys.Buffered() == 0 {
+				fds := []unix.PollFd{{Fd: int32(t.tty.Fd()), Events: unix.POLLIN}}
+				if n, _ := unix.Poll(fds, 40); n == 0 {
+					return 0, nil
+				}
+			}
+			second, _, err := t.keys.ReadRune()
+			if err != nil {
+				return 0, nil
+			}
+			switch second {
+			case 'A':
+				return 'k', nil
+			case 'B':
+				return 'j', nil
+			}
+		}
+		return 27, nil
 	}
 	if r == 3 {
 		return 0, errTUIQuit
@@ -222,12 +511,18 @@ func (t *tuiState) prompt(label string) (string, error) {
 	w, h := t.size()
 	var input []rune
 	for {
-		fmt.Fprintf(t.tty, "\x1b[%d;1H\x1b[2K%s\x1b[?25h", h, fit(label+string(input), w))
+		fmt.Fprintf(t.tty, "\x1b[%d;1H\x1b[2K%s\x1b[?25h", h, fit(label+string(input), max(1, w-1)))
 		r, err := t.key()
 		if err != nil {
 			return "", err
 		}
 		switch r {
+		case 0:
+			w, h = t.size()
+			continue
+		case 27:
+			fmt.Fprint(t.tty, "\x1b[?25l")
+			return "", errTUICancel
 		case '\r', '\n':
 			fmt.Fprint(t.tty, "\x1b[?25l")
 			return string(input), nil
@@ -254,21 +549,29 @@ func (t *tuiState) view(title, content string) error {
 	for {
 		w, h := t.size()
 		fmt.Fprint(t.tty, "\x1b[H\x1b[2J")
-		fmt.Fprintln(t.tty, fit(title+"  ↑/↓ scroll  q/Enter back", w))
-		fmt.Fprintln(t.tty, strings.Repeat("─", min(w, 80)))
-		for i := 0; i < h-3; i++ {
+		fmt.Fprint(t.tty, fit(" "+title, max(1, w-1)), "\r\n")
+		fmt.Fprint(t.tty, fit(" "+strings.Repeat("─", max(0, w-3)), max(1, w-1)), "\r\n")
+		for i := 0; i < max(0, h-3); i++ {
 			if offset+i < len(lines) {
-				fmt.Fprintln(t.tty, fit(lines[offset+i], w))
+				fmt.Fprint(t.tty, fit(lines[offset+i], max(1, w-1)))
 			} else {
-				fmt.Fprintln(t.tty)
+				fmt.Fprint(t.tty, "")
 			}
+			fmt.Fprint(t.tty, "\r\n")
 		}
+		fmt.Fprint(t.tty, fit(" ↑↓ scroll   Enter/Esc back", max(1, w-1)))
 		key, err := t.key()
+		for key == 0 && err == nil {
+			if nextW, nextH := t.size(); nextW != w || nextH != h {
+				break
+			}
+			key, err = t.key()
+		}
 		if err != nil {
 			return err
 		}
 		switch key {
-		case 'q', '\r', '\n':
+		case 'q', 27, '\r', '\n':
 			return nil
 		case 'j':
 			if offset < max(0, len(lines)-(h-3)) {
@@ -300,7 +603,18 @@ func (t *tuiState) apply(args ...string) {
 func (t *tuiState) loop() error {
 	for {
 		t.draw()
-		key, err := t.key()
+		w, h := t.size()
+		var key rune
+		var err error
+		for {
+			key, err = t.key()
+			if key != 0 || err != nil {
+				break
+			}
+			if nextW, nextH := t.size(); nextW != w || nextH != h {
+				break
+			}
+		}
 		if errors.Is(err, errTUIQuit) {
 			return nil
 		}
@@ -310,12 +624,31 @@ func (t *tuiState) loop() error {
 		if key == 'q' {
 			return nil
 		}
-		if key == 'j' && t.selected+1 < len(t.rows) {
-			t.selected++
+		if key == 'j' {
+			t.move(1)
 			continue
 		}
-		if key == 'k' && t.selected > 0 {
-			t.selected--
+		if key == 'k' {
+			t.move(-1)
+			continue
+		}
+		if key == '\t' {
+			t.showAll = !t.showAll
+			t.ensureSelection()
+			t.message = ""
+			continue
+		}
+		if key == '/' {
+			query, err := t.prompt(" Search: ")
+			if errors.Is(err, errTUICancel) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			t.query = strings.TrimSpace(query)
+			t.ensureSelection()
+			t.message = ""
 			continue
 		}
 		if key == 'R' {
@@ -327,13 +660,15 @@ func (t *tuiState) loop() error {
 			continue
 		}
 		if key == '?' {
-			if err := t.view("Help", "Select a service with ↑/↓ or j/k.\nEnter: status   v: unit file   l: recent logs\nn: create   e: set a setting   u: unset a setting   c: clone\ns: start   t: stop   r: restart\nb: enable or disable at boot   m: mask or unmask\nx: remove a local unit   R: refresh   q: quit\n\nSettings use aliases such as exec, workdir, restart, and env.NAME,\nor Section.Key such as Service.TimeoutStartSec."); err != nil && !errors.Is(err, errTUIQuit) {
+			if err := t.view("Keyboard shortcuts", "BROWSE\n  ↑/↓ or j/k  Move     /  Search names and descriptions\n  Tab         Toggle focus / all services\n  Enter       Status   v  Unit file   l  Recent logs\n\nMANAGE\n  n  Create       e  Set a setting   u  Unset a setting\n  c  Clone        s  Start           t  Stop\n  r  Restart      b  Enable/disable  m  Mask/unmask\n  x  Remove local unit             R  Refresh\n\n  Esc cancels a prompt. q quits.\n\nSettings: exec, workdir, restart, env.NAME,\nor Section.Key such as Service.TimeoutStartSec."); err != nil && !errors.Is(err, errTUIQuit) {
 				return err
 			}
 			continue
 		}
 		if err := t.action(key); errors.Is(err, errTUIQuit) {
 			return nil
+		} else if errors.Is(err, errTUICancel) {
+			continue
 		} else if err != nil {
 			t.message = clean(err.Error())
 		}
@@ -389,7 +724,7 @@ func (t *tuiState) action(key rune) error {
 			args = []string{"logs", name, "-n", "100"}
 		}
 		output, err := t.command(args...)
-		if err != nil {
+		if err != nil && strings.TrimSpace(output) == "" {
 			t.message = err.Error()
 			return nil
 		}
