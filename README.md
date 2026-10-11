@@ -1,6 +1,6 @@
 # services
 
-`services` is a small Go CLI for everyday systemd work. It creates units, lists them, shows their effective configuration, edits settings through drop-ins, clones units, controls them, and reads logs.
+`services` is a small Go service manager with an interactive terminal UI and command-line commands. It creates units, lists them, shows their effective configuration, edits settings through drop-ins, clones units, controls them, and reads logs.
 
 ## Install
 
@@ -12,6 +12,18 @@ sudo install -m 0755 services /usr/local/bin/services
 ```
 
 System services are stored in `/etc/systemd/system` and normally require `sudo`. Put `--user` immediately after `services` to manage units in `~/.config/systemd/user` instead.
+
+## Terminal UI
+
+```sh
+services tui 'YOUR_SUDO_PASSWORD'
+# No sudo password is needed for your own systemd user services:
+services --user tui
+```
+
+The system TUI checks the password once and opens an elevated session. Use arrow keys or `j`/`k` to select a service, `Enter` for status, `?` for all shortcuts, and `q` to quit. The UI asks for confirmation before stopping, restarting, disabling, masking, or removing a service. Removal stops and disables the service and deletes its local unit file.
+
+Putting a password on the command line can expose it in shell history and process listings. If that matters on your machine, run `sudo services tui` instead; an already elevated TUI needs no password argument. The application installed above is named `services`. If you build it under the name `service`, the same subcommand works as `service tui 'YOUR_SUDO_PASSWORD'`.
 
 ## Common tasks
 

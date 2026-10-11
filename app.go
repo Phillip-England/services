@@ -67,6 +67,8 @@ func (a *app) run() error {
 	case "help", "-h", "--help":
 		a.help()
 		return nil
+	case "tui":
+		return a.tui(args)
 	case "new", "add", "create":
 		return a.newService(args)
 	case "ls", "list":
@@ -102,6 +104,7 @@ func (a *app) help() {
 
 Usage: services [--user] COMMAND [arguments]
 
+  tui [SUDO_PASSWORD]                Interactive service manager
   new NAME --exec COMMAND [options]   Create a service
   ls                                 List installed services
   show NAME                          Show effective unit configuration
