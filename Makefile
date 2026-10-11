@@ -11,8 +11,8 @@ build:
 	bun run build
 
 install: build
-	install -d "$(DESTDIR)$(PREFIX)/bin"
-	install -m 0755 dist/services "$(DESTDIR)$(PREFIX)/bin/services"
+	sudo install -d "$(DESTDIR)$(PREFIX)/bin"
+	sudo install -m 0755 dist/services "$(DESTDIR)$(PREFIX)/bin/services"
 
 test:
 	bun run typecheck
